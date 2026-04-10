@@ -1,0 +1,109 @@
+name: Deploy IT Tools
+
+on:
+  schedule:
+    - cron: "0 0 * * 1" # Every Monday at midnight UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force deployment even if already up-to-date"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Get latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api repos/CorentinTh/it-tools/releases/latest --jq '.tag_name')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG"
+
+      - name: Check currently deployed version
+        id: current
+        run: |
+          SITE_URL="https://tools.martint.me/.version"
+          VERSION=$(curl -sfL "$SITE_URL" | head -1 || echo "none")
+          if ! echo "$VERSION" | grep -qE '^v[0-9]'; then
+            VERSION="none"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Currently deployed: $VERSION"
+
+      - name: Determine if deployment is needed
+        id: check
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.tag }}"
+          CURRENT="${{ steps.current.outputs.version }}"
+          FORCE="${{ inputs.force || 'false' }}"
+
+          if [ "$FORCE" = "true" ] || [ "$UPSTREAM" != "$CURRENT" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Deploying $UPSTREAM (current: $CURRENT, force: $FORCE)"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up-to-date ($CURRENT)"
+          fi
+
+      - name: Checkout upstream repository
+        if: steps.check.outputs.deploy == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: CorentinTh/it-tools
+          ref: ${{ steps.upstream.outputs.tag }}
+
+      - name: Setup Node.js
+        if: steps.check.outputs.deploy == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        if: steps.check.outputs.deploy == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Install dependencies
+        if: steps.check.outputs.deploy == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build with correct base path
+        if: steps.check.outputs.deploy == 'true'
+        run: npx vite build --base=/
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+
+      - name: Add version marker
+        if: steps.check.outputs.deploy == 'true'
+        run: echo "${{ steps.upstream.outputs.tag }}" > dist/.version
+
+      - name: Configure GitHub Pages
+        if: steps.check.outputs.deploy == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: steps.check.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        if: steps.check.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
